@@ -118,6 +118,23 @@ answer = store.ai_answer(
 )
 ```
 
+
+### Search tuning
+
+Retrieval (search and RAG grounding) runs through the platform's tuned
+pipeline: global defaults → your index's saved **Search Tuning** (Control
+Panel → Index Settings → Search Tuning: semantic↔lexical balance, field
+weights, minimum match, search mode, vector candidate pool, content quality
+boost) → optional per-call overrides via `tuning`:
+
+```
+tuning={"search_mode": "keywords_required", "fw_title": 0.2,
+        "mm": "strict", "vector_topk": 500, "quality_boost": 0.3}
+```
+
+Defaults match the platform's PHP configuration exactly — customize in the
+Control Panel once, or per call from code.
+
 ## How it's tested
 
 Every release is validated against **live Opensolr infrastructure** — no mocks:

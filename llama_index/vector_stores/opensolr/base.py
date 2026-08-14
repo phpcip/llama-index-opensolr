@@ -251,6 +251,7 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         rag_docs: int = 3,
         rag_words: int = 1500,
         instruction: Optional[str] = None,
+        tuning: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> str:
         """Grounded RAG answer generated only from this index's content.
@@ -260,13 +261,17 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         title/description/text become the LLM context — the same pipeline as
         Opensolr's hosted search UI. Pass ``instruction`` to fully control
         the prompt (e.g. "Answer in German, cite the sources you used").
-        Returns plain text.
+        Retrieval uses the platform's tuned pipeline: your index's saved
+        Search Tuning (Control Panel) applies automatically; ``tuning``
+        overrides any knob per call (fw_title, lexical_weight, search_mode,
+        mm, vector_topk, quality_boost, ...). Returns plain text.
         """
         fqs = _filters_to_fq(filters)
         fq = " AND ".join(f"({f})" for f in fqs) if fqs else None
         return self._client.ai_summary(
             self.index_name, query, filter_query=fq,
             rag_docs=rag_docs, rag_words=rag_words, instruction=instruction,
+            tuning=tuning,
             **kwargs,
         )
 
