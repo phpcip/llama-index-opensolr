@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llama-index-opensolr"
-version = "0.2.2"
+version = "0.2.3"
 description = "LlamaIndex integration for Opensolr — managed Apache Solr vector store with server-side embeddings and hybrid BM25+kNN search"
 readme = "README.md"
 license = { text = "MIT" }
