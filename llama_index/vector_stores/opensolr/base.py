@@ -244,6 +244,32 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         self._ensure_index()
         self._client.solr_update(self.index_name, {"delete": {"query": "*:*"}})
 
+    def ai_answer(
+        self,
+        query: str,
+        filters: Optional[MetadataFilters] = None,
+        rag_docs: int = 3,
+        rag_words: int = 1500,
+        instruction: Optional[str] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Grounded RAG answer generated only from this index's content.
+
+        Two-step pattern: hybrid (BM25 + kNN) retrieval picks the top
+        ``rag_docs`` hits (first ``rag_words`` words of text each), whose
+        title/description/text become the LLM context — the same pipeline as
+        Opensolr's hosted search UI. Pass ``instruction`` to fully control
+        the prompt (e.g. "Answer in German, cite the sources you used").
+        Returns plain text.
+        """
+        fqs = _filters_to_fq(filters)
+        fq = " AND ".join(f"({f})" for f in fqs) if fqs else None
+        return self._client.ai_summary(
+            self.index_name, query, filter_query=fq,
+            rag_docs=rag_docs, rag_words=rag_words, instruction=instruction,
+            **kwargs,
+        )
+
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         """Vector or hybrid query. HYBRID mode uses Opensolr's ``{!hybrid}``
         parser with ``query.alpha`` as the semantic↔lexical balance."""
