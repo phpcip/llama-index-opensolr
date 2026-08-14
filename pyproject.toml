@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llama-index-opensolr"
+version = "0.1.0"
+description = "LlamaIndex integration for Opensolr — managed Apache Solr vector store with server-side embeddings and hybrid BM25+kNN search"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Opensolr", email = "support@opensolr.com" }]
+dependencies = [
+    "llama-index-core>=0.11.0",
+    "httpx>=0.25.0",
+]
+keywords = ["llamaindex", "llama-index", "opensolr", "solr", "vector", "hybrid-search", "rag", "embeddings"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://opensolr.com/langchain"
+Repository = "https://github.com/phpcip/llama-index-opensolr"
+
+[tool.setuptools.packages.find]
+include = ["llama_index.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
