@@ -74,6 +74,40 @@ def _filters_to_fq(filters: Optional[MetadataFilters]) -> List[str]:
     return fq
 
 
+
+
+_RESERVED_META = ("rtf", "uri", "url")
+
+
+def _build_ingest_doc(index: str, text: str, metadata: dict, doc_id: str) -> tuple:
+    """Build one Data Ingestion API document. Returns (doc, solr_id)."""
+    import hashlib
+    from urllib.parse import quote
+
+    meta = dict(metadata or {})
+    uri = meta.get("uri") or meta.get("url")
+    if not (isinstance(uri, str) and uri.startswith(("http://", "https://"))):
+        uri = f"https://ingest.opensolr.com/{index}/{quote(str(doc_id), safe='')}"
+    uri = uri.rstrip("/")
+    text = text or " "
+    doc = {
+        "uri": uri,
+        "title": str(meta.get("title") or text[:100] or uri)[:250],
+        "description": str(meta.get("description") or text[:200]),
+        "text": text,
+        "meta_ext_id": str(doc_id),
+        "meta_lc_json": json.dumps(meta, ensure_ascii=False),
+    }
+    if meta.get("rtf"):
+        doc["rtf"] = True
+    if meta.get("timestamp"):
+        doc["timestamp"] = meta["timestamp"]
+    for key, value in meta.items():
+        if isinstance(value, (str, int, float, bool)) and key not in _RESERVED_META:
+            doc[_meta_field(str(key))] = str(value)
+    return doc, hashlib.md5(uri.encode()).hexdigest()
+
+
 class OpensolrVectorStore(BasePydanticVectorStore):
     """Managed hybrid vector store on Opensolr.
 
@@ -105,6 +139,7 @@ class OpensolrVectorStore(BasePydanticVectorStore):
     index_name: str
     create_if_missing: bool = False
     location: str = "us"
+    ingest_wait: bool = True
 
     _client: OpensolrClient = PrivateAttr()
     _checked: bool = PrivateAttr(default=False)
@@ -117,12 +152,14 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         client: Optional[OpensolrClient] = None,
         create_if_missing: bool = False,
         location: str = "us",
+        ingest_wait: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(
             index_name=index_name,
             create_if_missing=create_if_missing,
             location=location,
+            ingest_wait=ingest_wait,
             **kwargs,
         )
         if client is None:
@@ -162,37 +199,28 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         self._checked = True
 
     def add(self, nodes: List[BaseNode], **kwargs: Any) -> List[str]:
-        """Index nodes. Nodes without embeddings are embedded server-side."""
+        """Queue nodes through the Opensolr Data Ingestion API (async).
+
+        Embeddings and all derived fields are computed server-side; documents
+        become searchable within ~1 minute. With the default
+        ``ingest_wait=True`` this blocks until the queue job completes, so
+        ``VectorStoreIndex.from_documents(...)`` is immediately queryable.
+        """
         if not nodes:
             return []
         self._ensure_index()
 
-        texts = [n.get_content(metadata_mode="none") or " " for n in nodes]
-        embeddings: List[Optional[List[float]]] = [n.get_embedding() if n.embedding is not None else None for n in nodes]
-        missing = [i for i, e in enumerate(embeddings) if e is None]
-        if missing:
-            computed = self._client.batch_embed(self.index_name, [texts[i] for i in missing])
-            for i, vec in zip(missing, computed):
-                embeddings[i] = vec
-
         docs = []
-        for node, text, vector in zip(nodes, texts, embeddings):
+        for node in nodes:
             meta = dict(node.metadata or {})
-            doc: Dict[str, Any] = {
-                "id": node.node_id,
-                "text": text,
-                "embeddings": vector,
-                "meta_lc_json": json.dumps(meta, ensure_ascii=False),
-                "title": str(meta.get("title") or text[:100]),
-            }
             if node.ref_doc_id:
-                doc[_meta_field("ref_doc_id")] = node.ref_doc_id
-            for key, value in meta.items():
-                if isinstance(value, (str, int, float, bool)):
-                    doc[_meta_field(str(key))] = str(value)
+                meta["ref_doc_id"] = node.ref_doc_id
+            text = node.get_content(metadata_mode="none") or " "
+            doc, _sid = _build_ingest_doc(self.index_name, text, meta, node.node_id)
             docs.append(doc)
 
-        self._client.solr_update(self.index_name, docs)
+        for i in range(0, len(docs), 50):
+            self._client.ingest(self.index_name, docs[i : i + 50], wait=self.ingest_wait)
         return [n.node_id for n in nodes]
 
     def delete(self, ref_doc_id: str, **kwargs: Any) -> None:
@@ -206,7 +234,11 @@ class OpensolrVectorStore(BasePydanticVectorStore):
     def delete_nodes(self, node_ids: Optional[List[str]] = None, **kwargs: Any) -> None:
         if node_ids:
             self._ensure_index()
-            self._client.solr_update(self.index_name, {"delete": list(node_ids)})
+            joined = " OR ".join(f'"{_escape(i)}"' for i in node_ids)
+            self._client.solr_update(
+                self.index_name,
+                {"delete": {"query": f"id:({joined}) OR meta_ext_id:({joined})"}},
+            )
 
     def clear(self) -> None:
         self._ensure_index()
@@ -218,17 +250,27 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         self._ensure_index()
         k = query.similarity_top_k
 
-        vector = query.query_embedding
-        if vector is None:
-            if not query.query_str:
-                raise ValueError("Query needs query_embedding or query_str")
-            vector = self._client.embed(self.index_name, query.query_str, is_query=True)
-
-        compact = json.dumps(vector, separators=(",", ":"))
-        knn = f"{{!knn f=embeddings topK={max(k, 10)}}}{compact}"
-
         params: Dict[str, Any] = {"rows": k, "fl": "*,score"}
-        if query.mode in (VectorStoreQueryMode.HYBRID, VectorStoreQueryMode.SEMANTIC_HYBRID) and query.query_str:
+
+        if query.mode == VectorStoreQueryMode.TEXT_SEARCH:
+            # Pure lexical (edismax): no embedding call, zero AI quota,
+            # works on any Opensolr index including non-vector ones.
+            if not query.query_str:
+                raise ValueError("TEXT_SEARCH mode needs query_str")
+            clean = query.query_str.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["q"] = f'{{!edismax qf="title^100 description^20 text^1"}}{clean}'
+            knn = None
+        else:
+            vector = query.query_embedding
+            if vector is None:
+                if not query.query_str:
+                    raise ValueError("Query needs query_embedding or query_str")
+                vector = self._client.embed(self.index_name, query.query_str, is_query=True)
+            compact = json.dumps(vector, separators=(",", ":"))
+            knn = f"{{!knn f=embeddings topK={max(k, 10)}}}{compact}"
+        if knn is None:
+            pass
+        elif query.mode in (VectorStoreQueryMode.HYBRID, VectorStoreQueryMode.SEMANTIC_HYBRID) and query.query_str:
             alpha = query.alpha if query.alpha is not None else 0.5
             clean = query.query_str.replace("{", " ").replace("}", " ").replace('"', " ")
             params["q"] = (
@@ -237,7 +279,7 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             )
             params["lexicalRaw"] = f'{{!edismax qf="title^100 text^1"}}{clean}'
             params["vectorQuery"] = knn
-        else:
+        elif knn is not None:
             params["q"] = knn
 
         fq = _filters_to_fq(query.filters)
@@ -269,7 +311,8 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             text = _flat(doc.get("text", "")) or ""
             if isinstance(text, list):
                 text = " ".join(str(t) for t in text)
-            node_id = str(_flat(doc.get("id", "")))
+            ext = _flat(doc.get("meta_ext_id"))
+            node_id = str(ext) if ext else str(_flat(doc.get("id", "")))
             nodes.append(TextNode(id_=node_id, text=str(text), metadata=metadata))
             similarities.append(float(_flat(doc.get("score", 0.0)) or 0.0))
             ids.append(node_id)
