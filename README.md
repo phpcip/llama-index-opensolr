@@ -4,6 +4,8 @@ LlamaIndex integration for [Opensolr](https://opensolr.com) — managed Apache
 Solr as a vector store, with **server-side embeddings** and native **hybrid
 (BM25 + kNN) search**.
 
+**See it live (real news index, hybrid + AI answer):** https://search.opensolr.com/news__dense?q=how+am+I+supposed+to+save+money%3F
+
 No local embedding model. No third-party embedding API key. One set of
 credentials; vectors are computed on Opensolr's GPU infrastructure
 (multilingual E5-large-instruct, 1024 dimensions, cosine).
