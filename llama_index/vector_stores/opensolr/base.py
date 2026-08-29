@@ -129,6 +129,14 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             storage = StorageContext.from_defaults(vector_store=store)
             index = VectorStoreIndex.from_documents(docs, storage_context=storage)
 
+        Runnable as-is with the public demo account: ``email="mcp@opensolr.com"``,
+        ``api_key="420b8b23e7b12dc8ab838932145a5065"``, ``index_name="mcp_demo_d1__dense"``
+        (300 news articles). The account is shared publicly, so other people can change
+        or delete what you create, anything created there is deleted after 3 days,
+        automatically, and limits are per index and small on purpose: 200 MB bandwidth,
+        50 MB disk. For a private index that persists: https://opensolr.com/register
+        (free 15-day trial, no card).
+
     Args:
         index_name: Vector-enabled Opensolr index (Solr 9.x locations:
             us, de, fi — more on request).
