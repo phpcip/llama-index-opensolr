@@ -28,7 +28,11 @@ from llama_index.core.vector_stores.types import (
     VectorStoreQueryResult,
 )
 
-from llama_index.vector_stores.opensolr.client import OpensolrClient, OpensolrError
+from llama_index.vector_stores.opensolr.client import (
+    OpensolrClient,
+    OpensolrError,
+    apply_fresh_bias,
+)
 
 _META_KEY_RE = re.compile(r"[^a-z0-9_]+")
 
@@ -248,7 +252,9 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         self,
         query: str,
         filters: Optional[MetadataFilters] = None,
-        rag_docs: int = 3,
+        # 4 documents is the platform's measured context size (OpensolrClient.RAG_DOCS);
+        # this used to pass 3, which quietly overrode the client default with a smaller one.
+        rag_docs: int = 4,
         rag_words: int = 1500,
         instruction: Optional[str] = None,
         tuning: Optional[Dict[str, Any]] = None,
@@ -263,8 +269,20 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         the prompt (e.g. "Answer in German, cite the sources you used").
         Retrieval uses the platform's tuned pipeline: your index's saved
         Search Tuning (Control Panel) applies automatically; ``tuning``
-        overrides any knob per call (fw_title, lexical_weight, search_mode,
-        mm, vector_topk, quality_boost, ...). Returns plain text.
+        overrides any knob per call. The list below is the whole set, not a
+        sample: an abbreviated one reads as everything that is supported, and
+        ``freshness_boost`` was invisible to callers because of it.
+        ``fw_title``, ``fw_description``, ``fw_uri``, ``fw_text``,
+        ``fw_text_t``, ``lexical_weight``, ``vector_weight``, ``vector_topk``,
+        ``search_mode`` (union / keywords_required / meaning_required /
+        intersection), ``quality_boost``, ``min_score``, ``freshness_boost``,
+        ``fresh_bias``, ``lexical_norm_k``, ``mm`` (flexible / balanced /
+        strict or raw Solr mm syntax). ``freshness_boost`` and ``fresh_bias``
+        are different knobs despite the names: the first is a hard window in
+        DAYS that filters older documents out, the second only re-orders,
+        multiplying each score by a recency curve on ``creation_date`` so
+        recent documents win ties while nothing becomes unreachable.
+        Returns plain text.
         """
         fqs = _filters_to_fq(filters)
         fq = " AND ".join(f"({f})" for f in fqs) if fqs else None
@@ -277,9 +295,19 @@ class OpensolrVectorStore(BasePydanticVectorStore):
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         """Vector or hybrid query. HYBRID mode uses Opensolr's ``{!hybrid}``
-        parser with ``query.alpha`` as the semantic↔lexical balance."""
+        parser with ``query.alpha`` as the semantic↔lexical balance.
+
+        ``fresh_bias=True`` biases the ranking toward recent documents,
+        multiplying each score by a recency curve on ``creation_date``. It
+        re-orders and never filters — the hit count is unchanged, nothing old
+        becomes unreachable, and a document with no ``creation_date`` is simply
+        left unboosted. Works in every mode below. Off by default."""
         self._ensure_index()
         k = query.similarity_top_k
+        # fresh_bias arrives through **kwargs because VectorStoreQuery is
+        # LlamaIndex's own dataclass and has no field for it — a keyword on the
+        # call is the only place a caller can put it without a fork of the schema.
+        fresh_bias = bool(kwargs.get("fresh_bias", False))
 
         params: Dict[str, Any] = {"rows": k, "fl": "*,score"}
 
@@ -312,6 +340,12 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             params["vectorQuery"] = knn
         elif knn is not None:
             params["q"] = knn
+
+        # Fresh Results Bias wraps whichever shape was built above — edismax,
+        # fused {!hybrid} or bare {!knn} — so the recency multiplier reaches every
+        # candidate, including the vector-only ones an edismax bf never sees.
+        if fresh_bias:
+            apply_fresh_bias(params)
 
         fq = _filters_to_fq(query.filters)
         if query.node_ids:
