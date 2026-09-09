@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -74,10 +75,13 @@ from llama_index.vector_stores.opensolr.client import (
     DOC_FENCE,
     FRESH_BIAS_FUNCTION,
     MGMT_BASE,
+    SEARCH_OPERATOR_FIELDS,
     VECTOR_LOCATIONS,
     apply_fresh_bias,
+    apply_search_operators,
     build_context,
     build_instruction,
+    parse_operators,
     resolve_location,
 )
 
@@ -164,6 +168,42 @@ S: dict = {}          # values checks hand to later checks
 def _short(text: str, limit: int = 220) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def c_parse_operators():
+    cases = {
+        "did juventus win that match? -Ruben": ("did juventus win that match?", [], ["Ruben"]),
+        '+laptop +"13 inch" -refurbished': ("", ["laptop", '"13 inch"'], ["refurbished"]),
+        'laptop -"open box" gaming': ("laptop gaming", [], ['"open box"']),
+        # a '-' mid-token is part of the word, not an operator
+        "e-mail covid-19 1+1 formula": ("e-mail covid-19 1+1 formula", [], []),
+        # a '-' INSIDE a quoted phrase belongs to the phrase
+        '"foo -bar" baz': ('"foo -bar" baz', [], []),
+        # a lone sign, or an empty operand, is plain text
+        'cafea + - fara +"" zahar': ('cafea + - fara +"" zahar', [], []),
+    }
+    for raw, (base, req, exc) in cases.items():
+        got = parse_operators(raw)
+        assert got["base"] == base, (raw, got["base"], base)
+        assert got["required"] == req, (raw, got["required"], req)
+        assert got["excluded"] == exc, (raw, got["excluded"], exc)
+        assert got["has_ops"] == bool(req or exc), (raw, got["has_ops"])
+    return f"{len(cases)} queries split exactly, hyphenated words and quoted '-' left alone"
+
+
+def c_apply_search_operators():
+    params = {"q": "{!hybrid}", "fq": ["meta_kind:news"]}
+    out = apply_search_operators(params, parse_operators('news +"press release" -rumour'))
+    assert out is params, "must mutate and return the same dict"
+    assert params["reqQ0"] == '"press release"', params.get("reqQ0")
+    assert params["negQ0"] == "rumour", params.get("negQ0")
+    want_req = '{!edismax qf="%s" mm="100%%" v=$reqQ0}' % SEARCH_OPERATOR_FIELDS
+    want_neg = '-{!edismax qf="%s" mm="100%%" v=$negQ0}' % SEARCH_OPERATOR_FIELDS
+    assert want_req in params["fq"], params["fq"]
+    assert want_neg in params["fq"], params["fq"]
+    assert "meta_kind:news" in params["fq"], "a pre-existing fq must survive"
+    assert params["q"] == "{!hybrid}", "q must be untouched"
+    return "operands bound by reference, both filters added, existing fq kept"
 
 
 def check(label, fn):
@@ -288,6 +328,10 @@ def test_pure_builders() -> None:
         return "q wrapped in {!boost}, inner query moved to $freshBiasInner"
 
     check("apply_fresh_bias wraps q and preserves the inner query", c_fresh_bias)
+    check("parse_operators splits +/- operators and leaves ordinary text alone",
+          c_parse_operators)
+    check("apply_search_operators emits fq filters and keeps existing ones",
+          c_apply_search_operators)
 
     def c_context():
         docs = [
@@ -924,6 +968,92 @@ def test_store_read(client: OpensolrClient) -> None:
         else:
             raise AssertionError("a query with neither text nor vector was accepted")
         return "both empty-query shapes raise ValueError"
+
+    def _ops_fixture():
+        """Pick a real word and a real adjacent word pair out of the top hybrid hit.
+
+        The demo corpus is not ours to hardcode, so the term to exclude comes from the corpus
+        itself. Excluding it MUST drop that node; requiring it must keep it.
+        """
+        if "ops_fixture" in S:
+            return S["ops_fixture"]
+        res = store.query(VectorStoreQuery(
+            query_str="football match", similarity_top_k=1,
+            mode=VectorStoreQueryMode.HYBRID, alpha=0.7,
+        ))
+        assert res.nodes, "baseline hybrid query returned nothing to build a fixture from"
+        node = res.nodes[0]
+        body = node.get_content()
+        words = re.findall(r"[A-Za-z]{6,}", body)
+        pair = re.search(r"([A-Za-z]{5,})\s+([A-Za-z]{5,})", body)
+        assert words and pair, f"top node has too little text: {body[:80]!r}"
+        S["ops_fixture"] = {"id": res.ids[0], "word": words[0],
+                            "phrase": f"{pair.group(1)} {pair.group(2)}"}
+        return S["ops_fixture"]
+
+    def _hybrid_ids(q, k=10):
+        res = store.query(VectorStoreQuery(
+            query_str=q, similarity_top_k=k,
+            mode=VectorStoreQueryMode.HYBRID, alpha=0.7,
+        ))
+        return list(res.ids or []), res
+
+    def c_ops_exclude_word():
+        fx = _ops_fixture()
+        ids, _ = _hybrid_ids(f"football match -{fx['word']}")
+        assert fx["id"] not in ids, (
+            f"-{fx['word']} did not remove the node containing it; {len(ids)} results")
+        return f"-{fx['word']} removed its node from {len(ids)} hybrid results"
+
+    check("-word excludes in HYBRID mode, where the vector leg used to smuggle it back",
+          c_ops_exclude_word)
+
+    def c_ops_require_word():
+        fx = _ops_fixture()
+        ids, _ = _hybrid_ids(f"football match +{fx['word']}", k=20)
+        assert ids, f"+{fx['word']} returned nothing at all"
+        assert fx["id"] in ids, f"+{fx['word']} dropped the node that does contain it"
+        return f"+{fx['word']} kept its node, {len(ids)} results"
+
+    check("+word is genuinely required in HYBRID mode", c_ops_require_word)
+
+    def c_ops_exclude_phrase():
+        fx = _ops_fixture()
+        ids, _ = _hybrid_ids(f'football match -"{fx["phrase"]}"')
+        assert fx["id"] not in ids, (
+            f'-"{fx["phrase"]}" did not remove the node containing that exact phrase')
+        return f'-"{fx["phrase"]}" removed its node from {len(ids)} results'
+
+    check('-"phrase" excludes an exact phrase in HYBRID mode', c_ops_exclude_phrase)
+
+    def c_ops_require_phrase():
+        fx = _ops_fixture()
+        ids, _ = _hybrid_ids(f'football match +"{fx["phrase"]}"', k=20)
+        assert ids, f'+"{fx["phrase"]}" returned nothing at all'
+        assert fx["id"] in ids, f'+"{fx["phrase"]}" dropped the node containing that phrase'
+        return f'+"{fx["phrase"]}" kept its node, {len(ids)} results'
+
+    check('+"phrase" requires an exact phrase in HYBRID mode', c_ops_require_phrase)
+
+    def c_ops_only_query():
+        fx = _ops_fixture()
+        ids, _ = _hybrid_ids(f"-{fx['word']}", k=5)
+        assert ids, "a query made of nothing but an exclusion must still return nodes"
+        assert fx["id"] not in ids, "the excluded node came back on the operators-only path"
+        return (f"'-{fx['word']}' alone falls back to keyword search and still excludes, "
+                f"{len(ids)} results")
+
+    check("a query that is nothing but operators still works and still excludes",
+          c_ops_only_query)
+
+    def c_ops_are_not_syntax():
+        # The operand is bound by reference, so Solr local params inside it stay text.
+        ids, res = _hybrid_ids('football match -{!join fromIndex=mcp_demo_d1__dense}x', k=3)
+        assert isinstance(res, VectorStoreQueryResult), type(res)
+        return f"a '{{!join}}' operand stayed literal text, {len(ids)} normal results"
+
+    check("an operand containing Solr local params is treated as text, not syntax",
+          c_ops_are_not_syntax)
 
     check("query() rejects queries with nothing to search on", c_query_guards)
 
