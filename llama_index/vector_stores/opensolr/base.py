@@ -32,6 +32,8 @@ from llama_index.vector_stores.opensolr.client import (
     OpensolrClient,
     OpensolrError,
     apply_fresh_bias,
+    apply_search_operators,
+    parse_operators,
 )
 
 _META_KEY_RE = re.compile(r"[^a-z0-9_]+")
@@ -319,35 +321,59 @@ class OpensolrVectorStore(BasePydanticVectorStore):
 
         params: Dict[str, Any] = {"rows": k, "fl": "*,score"}
 
-        if query.mode == VectorStoreQueryMode.TEXT_SEARCH:
+        # Search operators (+word, -word, +"phrase", -"phrase") come out of the text once,
+        # for every mode below. See parse_operators() for why they cannot stay inside the
+        # query on any path that involves a vector.
+        ops = parse_operators(query.query_str or "")
+        # Nothing left once the operators are removed ("-Ruben" alone): the operators ARE the
+        # query. Hand the whole string to edismax, which understands them natively, and emit
+        # no filters.
+        ops_only = ops["has_ops"] and len(ops["base"]) < 2
+        lexical_text = (query.query_str or "") if (not ops["has_ops"] or ops_only) else ops["base"]
+
+        if query.mode == VectorStoreQueryMode.TEXT_SEARCH or ops_only:
             # Pure lexical (edismax): no embedding call, zero AI quota,
             # works on any Opensolr index including non-vector ones.
             if not query.query_str:
                 raise ValueError("TEXT_SEARCH mode needs query_str")
-            clean = query.query_str.replace("{", " ").replace("}", " ").replace('"', " ")
-            params["q"] = f'{{!edismax qf="title^100 description^20 text^1"}}{clean}'
+            # Bound by reference (2026-09-09) instead of inlined: inlining meant a '}' in the
+            # caller's text closed the local-param block, which is why braces AND quotes were
+            # stripped first — and stripping quotes silently broke every phrase query.
+            params["uq"] = lexical_text
+            params["q"] = '{!edismax qf="title^100 description^20 text^1" v=$uq}'
             knn = None
         else:
             vector = query.query_embedding
             if vector is None:
                 if not query.query_str:
                     raise ValueError("Query needs query_embedding or query_str")
-                vector = self._client.embed(self.index_name, query.query_str, is_query=True)
+                # The embedder must never see an operator — it has no concept of negation, so
+                # a '-' term reads as one more word and pulls results towards what the caller
+                # asked to remove.
+                vector = self._client.embed(
+                    self.index_name,
+                    ops["base"] if ops["has_ops"] else query.query_str,
+                    is_query=True,
+                )
             compact = json.dumps(vector, separators=(",", ":"))
             knn = f"{{!knn f=embeddings topK={max(k, 10)}}}{compact}"
         if knn is None:
             pass
         elif query.mode in (VectorStoreQueryMode.HYBRID, VectorStoreQueryMode.SEMANTIC_HYBRID) and query.query_str:
             alpha = query.alpha if query.alpha is not None else 0.5
-            clean = query.query_str.replace("{", " ").replace("}", " ").replace('"', " ")
+            params["uq"] = lexical_text
             params["q"] = (
                 f"{{!hybrid lexical=$lexicalRaw vector=$vectorQuery "
                 f"mode=union alpha={alpha} topN={max(k, 10)}}}"
             )
-            params["lexicalRaw"] = f'{{!edismax qf="title^100 text^1"}}{clean}'
+            params["lexicalRaw"] = '{!edismax qf="title^100 text^1" v=$uq}'
             params["vectorQuery"] = knn
         elif knn is not None:
             params["q"] = knn
+        # Operators become filters on both vector-bearing shapes. On the pure-kNN shape this
+        # is the only thing that can honour them at all — that query has no edismax in it.
+        if knn is not None:
+            apply_search_operators(params, ops)
 
         # Fresh Results Bias wraps whichever shape was built above — edismax,
         # fused {!hybrid} or bare {!knn} — so the recency multiplier reaches every
@@ -363,7 +389,17 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             joined = " OR ".join(f'"{_escape(i)}"' for i in query.doc_ids)
             fq.append(f'{_meta_field("ref_doc_id")}:({joined})')
         if fq:
-            params["fq"] = fq
+            # EXTEND, never assign (2026-09-09). Two earlier steps put filters in params
+            # before this point — the search-operator filters and Fresh Results Bias's
+            # "must have a creation_date" clause — and a plain assignment silently dropped
+            # both the moment the caller also passed a metadata filter.
+            existing = params.get("fq")
+            if existing is None:
+                params["fq"] = fq
+            elif isinstance(existing, list):
+                params["fq"] = existing + fq
+            else:
+                params["fq"] = [existing] + fq
 
         body = self._client.solr_select(self.index_name, params)
 
