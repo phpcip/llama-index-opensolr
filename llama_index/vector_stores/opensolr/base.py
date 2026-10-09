@@ -270,6 +270,24 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             wait=self.ingest_wait if wait is None else wait, timeout=timeout,
         )
 
+    def check_schema(self) -> Dict[str, Any]:
+        """Whether this index is ready for every feature of the store, and exactly why not.
+
+        Returns the platform's check: ``ready``, ``capabilities`` (``ingestion``,
+        ``vector_search``, ``pdf_pages``, ``keyword_search``), the server, its Solr
+        version, the fields and types that differ from the Opensolr vector schema,
+        ``problems`` and ``fix``. The store runs this check once on its own.
+        """
+        return self._client.check_schema(self.index_name)
+
+    def apply_schema(self, force: bool = False) -> Dict[str, Any]:
+        """Install the Opensolr vector schema on this index (an index of a vector region).
+
+        It replaces the index configuration; an index that already holds documents needs
+        ``force=True``, and those documents must be sent again. Returns the new check.
+        """
+        return self._client.apply_schema(self.index_name, force=force)
+
     def image_to_words(self, image: Union[str, Path, bytes], top_k: int = 8) -> Dict[str, Any]:
         """Read an image and return what it was turned into, without searching yet.
 
@@ -415,7 +433,7 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         dated in that period (``creation_date``). ``group_pages`` (on by default) returns
         a PDF indexed page by page once, as its best page: the node's metadata carries
         ``page``, ``page_url`` (opens the PDF at that page), ``document_id`` and
-        ``more_pages`` (its other matching pages). Every node carries ``uri``."""
+        ``more_pages`` (its other matching pages) and its ``uri``."""
         self._ensure_index()
         k = query.similarity_top_k
         # fresh_bias arrives through **kwargs because VectorStoreQuery is
@@ -450,6 +468,8 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             params["q"] = '{!edismax qf="title^100 description^20 text^1" v=$uq}'
             knn = None
         else:
+            # An index without the vector fields says so before an embedding is paid for
+            self._client.require_capability(self.index_name, "vector_search")
             vector = query.query_embedding
             if vector is None:
                 if not query.query_str:
@@ -521,12 +541,13 @@ class OpensolrVectorStore(BasePydanticVectorStore):
                 text = " ".join(str(t) for t in text)
             ext = _flat(doc.get("meta_ext_id"))
             node_id = str(ext) if ext else str(_flat(doc.get("id", "")))
-            # Where the hit lives: uri; a page of a PDF adds page, page_url, document_id, more_pages
+            # A page of a PDF also says where it lives (uri, page, page_url, document_id, more_pages);
+            # any other node keeps exactly the metadata it was sent with
             where = page_info(doc, expanded)
-            for key, value in where.items():
-                if value not in ("", None):
-                    metadata.setdefault(key, value)
             if where.get("page"):
+                for key, value in where.items():
+                    if value not in ("", None):
+                        metadata.setdefault(key, value)
                 # every page of a PDF carries the PDF's meta_ext_id: the page number keeps node ids apart
                 node_id = f"{node_id}#page={where['page']}"
             nodes.append(TextNode(id_=node_id, text=str(text), metadata=metadata))
