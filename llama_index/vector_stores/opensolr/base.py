@@ -13,9 +13,11 @@ Solr query parser (per-document BM25 + kNN score fusion, ``alpha`` balance).
 
 from __future__ import annotations
 
+import base64
 import json
 import re
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, TextNode
@@ -31,8 +33,11 @@ from llama_index.core.vector_stores.types import (
 from llama_index.vector_stores.opensolr.client import (
     OpensolrClient,
     OpensolrError,
+    add_filters,
     apply_fresh_bias,
     apply_search_operators,
+    date_range_filter,
+    page_info,
     parse_operators,
 )
 
@@ -237,6 +242,99 @@ class OpensolrVectorStore(BasePydanticVectorStore):
             self._client.ingest(self.index_name, docs[i : i + 50], wait=self.ingest_wait)
         return [n.node_id for n in nodes]
 
+    def add_files(
+        self,
+        path: Union[str, Path],
+        pattern: str = "*",
+        recursive: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        wait: Optional[bool] = None,
+        timeout: float = 600.0,
+    ) -> Dict[str, Any]:
+        """Index local files: one file, or every file of a folder.
+
+        Each file is read on Opensolr (its text, its pictures through OCR) and a PDF is
+        indexed one document per page, so a query finds the page that answers it. Word,
+        RTF, OpenDocument, text, HTML and picture files (scans) are one document each.
+        ``pattern`` picks a folder's files (``"*.pdf"``), ``metadata`` goes on every
+        document (filterable like any metadata). Sending the same files again replaces
+        them. ``wait`` defaults to the store's ``ingest_wait``.
+
+        Returns ``{"documents", "pending", "failed", "jobs"}``: files still being read
+        when ``timeout`` ran out are under ``pending`` — call again to index them, the
+        bytes are not sent twice.
+        """
+        self._ensure_index()
+        return self._client.ingest_files(
+            self.index_name, path, pattern=pattern, recursive=recursive, metadata=metadata,
+            wait=self.ingest_wait if wait is None else wait, timeout=timeout,
+        )
+
+    def image_to_words(self, image: Union[str, Path, bytes], top_k: int = 8) -> Dict[str, Any]:
+        """Read an image and return what it was turned into, without searching yet.
+
+        Returns ``{"text", "mode", "labels", "codes"}``: the best words to search with,
+        whether it was read as visual labels ("clip") or OCR text ("ocr"), the visual
+        labels (present even in OCR mode), and any barcodes / QR codes. ``image`` is a
+        file path (str/Path) or raw image bytes.
+        """
+        raw = bytes(image) if isinstance(image, (bytes, bytearray)) else Path(image).expanduser().read_bytes()
+        ans = self._client.image_to_text(self.index_name, base64.b64encode(raw).decode("ascii"), top_k=top_k)
+        labels = [l["label"] for l in (ans.get("labels") or []) if isinstance(l, dict) and l.get("label")]
+        codes = []
+        for c in ans.get("codes") or []:
+            value = c.get("text") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+            if value:
+                codes.append(value)
+        return {"text": (ans.get("text") or "").strip(), "mode": ans.get("mode") or "clip", "labels": labels, "codes": codes}
+
+    def search_by_image(
+        self,
+        image: Union[str, Path, bytes],
+        similarity_top_k: int = 4,
+        using: str = "auto",
+        mode: VectorStoreQueryMode = VectorStoreQueryMode.HYBRID,
+        filters: Optional[MetadataFilters] = None,
+        image_top_k: int = 8,
+        **query_kwargs: Any,
+    ) -> VectorStoreQueryResult:
+        """Search the index with a photo instead of a text query.
+
+        The image is turned into words by :meth:`image_to_words`, then those words run
+        through :meth:`query` (``mode`` hybrid by default), so ``fresh_bias``,
+        ``date_from``, ``date_to`` and ``group_pages`` apply via ``query_kwargs``. No
+        image vector is stored.
+
+        ``using``: which reading to search with — ``"auto"`` (the engine's chosen text),
+        ``"meaning"`` (the visual labels), ``"text"`` (OCR text only), ``"code"`` (the
+        first barcode / QR code, as an exact keyword) or ``"all"`` (labels + OCR text +
+        barcodes combined). An image that gives no words returns an empty result.
+        """
+        read = self.image_to_words(image, top_k=image_top_k)
+        if using == "meaning":
+            words = ", ".join(read["labels"])
+        elif using == "text":
+            words = read["text"] if read["mode"] == "ocr" else ""
+        elif using == "code":
+            words = read["codes"][0] if read["codes"] else ""
+            mode = VectorStoreQueryMode.TEXT_SEARCH
+        elif using == "all":
+            parts = list(read["labels"])
+            if read["mode"] == "ocr" and read["text"]:
+                parts.append(read["text"])
+            parts.extend(read["codes"])
+            words = ", ".join(p for p in parts if p)
+        elif using == "auto":
+            words = read["text"]
+        else:
+            raise ValueError("using must be one of 'auto', 'meaning', 'text', 'code', 'all'")
+        if not words:
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+        return self.query(
+            VectorStoreQuery(query_str=words, similarity_top_k=similarity_top_k, mode=mode, filters=filters),
+            **query_kwargs,
+        )
+
     def delete(self, ref_doc_id: str, **kwargs: Any) -> None:
         """Delete all nodes belonging to a source document."""
         self._ensure_index()
@@ -311,13 +409,22 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         multiplying each score by a recency curve on ``creation_date``. It
         re-orders and never filters — the hit count is unchanged, nothing old
         becomes unreachable, and a document with no ``creation_date`` is simply
-        left unboosted. Works in every mode below. Off by default."""
+        left unboosted. Works in every mode below. Off by default.
+
+        ``date_from`` / ``date_to`` (``YYYY-MM-DD``, both included) keep only documents
+        dated in that period (``creation_date``). ``group_pages`` (on by default) returns
+        a PDF indexed page by page once, as its best page: the node's metadata carries
+        ``page``, ``page_url`` (opens the PDF at that page), ``document_id`` and
+        ``more_pages`` (its other matching pages). Every node carries ``uri``."""
         self._ensure_index()
         k = query.similarity_top_k
         # fresh_bias arrives through **kwargs because VectorStoreQuery is
         # LlamaIndex's own dataclass and has no field for it — a keyword on the
         # call is the only place a caller can put it without a fork of the schema.
         fresh_bias = bool(kwargs.get("fresh_bias", False))
+        group_pages = bool(kwargs.get("group_pages", True))
+        # Checked before anything is embedded: a malformed date is the caller's, not a GPU call's
+        period = date_range_filter(kwargs.get("date_from"), kwargs.get("date_to"))
 
         params: Dict[str, Any] = {"rows": k, "fl": "*,score"}
 
@@ -388,20 +495,12 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         if query.doc_ids:
             joined = " OR ".join(f'"{_escape(i)}"' for i in query.doc_ids)
             fq.append(f'{_meta_field("ref_doc_id")}:({joined})')
-        if fq:
-            # EXTEND, never assign (2026-09-09). Two earlier steps put filters in params
-            # before this point — the search-operator filters and Fresh Results Bias's
-            # "must have a creation_date" clause — and a plain assignment silently dropped
-            # both the moment the caller also passed a metadata filter.
-            existing = params.get("fq")
-            if existing is None:
-                params["fq"] = fq
-            elif isinstance(existing, list):
-                params["fq"] = existing + fq
-            else:
-                params["fq"] = [existing] + fq
+        # EXTEND, never assign: the search-operator filters and Fresh Results Bias's
+        # "must have a creation_date" clause are already in params by now.
+        add_filters(params, *fq, period)
 
-        body = self._client.solr_select(self.index_name, params)
+        body = self._client.select_grouped(self.index_name, params, group_pages)
+        expanded = body.get("expanded") or {}
 
         nodes: List[TextNode] = []
         similarities: List[float] = []
@@ -422,6 +521,14 @@ class OpensolrVectorStore(BasePydanticVectorStore):
                 text = " ".join(str(t) for t in text)
             ext = _flat(doc.get("meta_ext_id"))
             node_id = str(ext) if ext else str(_flat(doc.get("id", "")))
+            # Where the hit lives: uri; a page of a PDF adds page, page_url, document_id, more_pages
+            where = page_info(doc, expanded)
+            for key, value in where.items():
+                if value not in ("", None):
+                    metadata.setdefault(key, value)
+            if where.get("page"):
+                # every page of a PDF carries the PDF's meta_ext_id: the page number keeps node ids apart
+                node_id = f"{node_id}#page={where['page']}"
             nodes.append(TextNode(id_=node_id, text=str(text), metadata=metadata))
             similarities.append(float(_flat(doc.get("score", 0.0)) or 0.0))
             ids.append(node_id)

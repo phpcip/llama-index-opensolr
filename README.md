@@ -47,8 +47,8 @@ print(retriever.retrieve("how do keyword and semantic search combine?"))
 
 ## Try it without an account
 
-There is a public demo account. Point the package at it and everything in this
-README works immediately, with no signup:
+There is a public demo account. Point the package at it and search, ingestion and
+answers work immediately, with no signup:
 
 ```bash
 export OPENSOLR_EMAIL=mcp@opensolr.com
@@ -58,6 +58,8 @@ export OPENSOLR_API_KEY=420b8b23e7b12dc8ab838932145a5065
 `mcp_demo_d1__dense` is already loaded with 300 news articles, so search, filtering
 and grounded answers work the moment you connect. You also get the full write path:
 create your own index on the account, ingest into it, query it, delete it.
+Reading files and pictures (the file loader and file indexing below, search by image)
+needs your own key: the shared demo key does not include them.
 
 Know what you are working with:
 
@@ -155,6 +157,84 @@ text from PDF/DOCX/XLSX for you.
 Don't need vectors? Pure keyword search skips the embedding call entirely —
 zero AI quota, and it works on **any** Opensolr index, including non-vector
 ones and older Solr versions.
+
+## Local files: PDFs page by page, scans through OCR
+
+Read a file or a whole folder into LlamaIndex `Document`s with `OpensolrReader` —
+one Document per PDF page (`metadata["page_label"]`), one per any other file:
+
+```python
+from llama_index.readers.opensolr import OpensolrReader
+
+reader = OpensolrReader(index_name="mysite__dense", email="you@example.com",
+                        api_key="YOUR_OPENSOLR_API_KEY", pattern="*.pdf")
+docs = reader.load_data("./contracts")
+# metadata: file_path, file_name, file_type, page_label, is_ocr, language
+```
+
+Or index them straight into the store — no node parser, PDFs page by page:
+
+```python
+result = store.add_files("./contracts", pattern="*.pdf", metadata={"team": "legal"})
+# {"documents": [{path, source, uri, id}], "pending": [], "failed": [], "jobs": [...]}
+```
+
+- Each file is read on Opensolr's servers: its text, the text in its pictures (OCR,
+  more than 100 languages), a short description of the pictures without text. Word,
+  RTF, OpenDocument, text, HTML and picture files (scans) are one document each; a
+  **PDF is one document per page**.
+- The bytes travel once: a file the account already sent (same content) is not
+  uploaded again. Pictures read by OCR count 0.5 of an AI request each; a file read
+  before is free.
+- Files still being read when `timeout` runs out are listed in `reader.pending` (or
+  `result["pending"]`): run again to get them, nothing is sent twice. Files that could
+  not be read are in `reader.failed` / `result["failed"]`.
+- An indexed file's `uri` is `https://ingest.opensolr.com/<index>/<source>`, where
+  `source` is its path from the folder you sent (`metadata["source"]`); sending it
+  again replaces it. Its date is the file's modification time. Each page is its own
+  node (`<source>#page=<n>`).
+
+## Search by image
+
+Search the index with a **photo** instead of a text query. Opensolr reads the picture
+three ways — visual labels (what it depicts), OCR text (words printed on it), and any
+barcode / QR code — and turns that into an ordinary query. Nothing new is stored.
+
+```python
+read = store.image_to_words("photo.jpg")   # {'text', 'mode', 'labels', 'codes'}
+result = store.search_by_image("photo.jpg", similarity_top_k=4)        # hybrid
+result = store.search_by_image("photo.jpg", using="code")              # exact barcode / QR
+# using: "auto" | "meaning" (labels) | "text" (OCR only) | "code" | "all"
+```
+
+`search_by_image` returns a `VectorStoreQueryResult` and accepts the same keywords as
+`query()` — `fresh_bias`, `date_from`, `date_to`, `group_pages`.
+
+## PDF pages in search results
+
+On an index where PDFs are stored page by page (files indexed as above, PDFs sent to
+Data Ingestion with `rtf`, PDFs found by the Web Crawler), a search returns each PDF
+**once**, as its best page. Its metadata carries `page` (the page number),
+`page_url` (opens the PDF at that page, `...pdf#page=14`), `document_id`,
+`more_pages` (its other matching pages, each with `page` and `page_url`) and
+`matching_pages`; every hit carries its `uri`. `group_pages=False` returns the pages
+as separate results.
+
+## Searching a period
+
+`date_from` and `date_to` (`YYYY-MM-DD`, both included, either one can be left out)
+keep only the documents dated in that period (`creation_date`):
+
+```python
+from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
+
+result = store.query(
+    VectorStoreQuery(query_str="rate decision", similarity_top_k=5, mode=VectorStoreQueryMode.HYBRID),
+    date_from="2026-01-01", date_to="2026-03-31",
+)
+```
+
+They combine with every other option — filters, `fresh_bias`, hybrid or lexical.
 
 ## Your index schema
 
