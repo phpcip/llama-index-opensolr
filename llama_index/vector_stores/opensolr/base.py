@@ -1,7 +1,7 @@
 """Opensolr vector store implementation for LlamaIndex.
 
-Backed by a managed, vector-enabled Opensolr index (Apache Solr 9.x,
-``knn_vector`` 1024-dim, cosine). Embeddings are computed **server-side** on
+Backed by a managed, vector-enabled Opensolr index (an index in a vector region:
+a server with the Opensolr web crawler; ``knn_vector`` 1024-dim, cosine). Embeddings are computed **server-side** on
 Opensolr's GPU infrastructure, so this store works without any local
 embed model — pair it with
 :class:`llama_index.embeddings.opensolr.OpensolrEmbedding`, or let the store
@@ -145,12 +145,13 @@ class OpensolrVectorStore(BasePydanticVectorStore):
         (free forever, no card).
 
     Args:
-        index_name: Vector-enabled Opensolr index (Solr 9.x locations:
-            us, de, fi — more on request).
+        index_name: Vector-enabled Opensolr index, in a vector region (the servers
+            with the Opensolr web crawler, listed live by ``client.vector_regions()``).
         email: Opensolr account email.
         api_key: Opensolr API key.
         create_if_missing: Provision the index automatically on first use.
-        location: Where to create it (``us``, ``de``, ``fi``).
+        location: Where to create it: an environment id from ``client.vector_regions()``,
+            or a short name matched against that live list (``us``, ``de``, ``fi`` …).
     """
 
     stores_text: bool = True
